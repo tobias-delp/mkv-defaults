@@ -1,0 +1,27 @@
+# makepkg output
+/pkg/
+/src/
+*.pkg.tar.*
+*.src.tar.*
+/*.log
+
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+
+# Local media files
+*.[mM][kK][vV]
+
+# Editor / OS
+*~
+*.swp
+*.swo
+.DS_Store
+Thumbs.db

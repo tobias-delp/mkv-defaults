@@ -1,0 +1,217 @@
+#!/usr/bin/env python3
+
+import argparse
+import json
+import shutil
+import subprocess
+import sys
+from pathlib import Path
+
+VERSION = "1.0.0"
+
+
+def die(message, code=1):
+    print(f"Error: {message}", file=sys.stderr)
+    raise SystemExit(code)
+
+
+def require_commands():
+    for command in ("mkvmerge", "mkvpropedit"):
+        if shutil.which(command) is None:
+            die(f"required command '{command}' was not found")
+
+
+def inspect(path):
+    result = subprocess.run(
+        ["mkvmerge", "-J", str(path)],
+        text=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+    )
+    if result.returncode != 0:
+        die(f"could not inspect '{path}':\n{result.stderr.strip()}")
+    try:
+        return json.loads(result.stdout)
+    except json.JSONDecodeError as exc:
+        die(f"invalid JSON returned by mkvmerge for '{path}': {exc}")
+
+
+def tracks_of_type(info, track_type):
+    return [track for track in info.get("tracks", []) if track.get("type") == track_type]
+
+
+def track_description(track):
+    props = track.get("properties", {})
+    language = props.get("language", "und")
+    name = props.get("track_name") or "(no name)"
+    default = bool(props.get("default_track", False))
+    codec = track.get("codec", "unknown")
+    return language, name, default, codec
+
+
+def print_tracks(title, tracks):
+    print(title)
+    print("=" * len(title))
+    for number, track in enumerate(tracks, 1):
+        language, name, default, codec = track_description(track)
+        print(f"  [{number}] {language:<4}  {name:<45} {codec:<18} default={str(default).lower()}")
+
+
+def choose(label, tracks):
+    while True:
+        try:
+            raw = input(f"Choose default {label} track: ").strip()
+        except (EOFError, KeyboardInterrupt):
+            print("\nCancelled.")
+            raise SystemExit(130)
+        try:
+            choice = int(raw)
+        except ValueError:
+            print("Please enter a track number.")
+            continue
+        if 1 <= choice <= len(tracks):
+            return choice
+        print(f"Please choose a number from 1 to {len(tracks)}.")
+
+
+def signature(tracks):
+    # Protect against equal track counts with obviously different layouts.
+    return [
+        (
+            t.get("properties", {}).get("language", "und"),
+            t.get("properties", {}).get("track_name") or "",
+            t.get("codec", ""),
+        )
+        for t in tracks
+    ]
+
+
+def edit_file(path, audio_count, subtitle_count, audio_choice, subtitle_choice):
+    command = ["mkvpropedit", str(path)]
+
+    for i in range(1, audio_count + 1):
+        command += ["--edit", f"track:a{i}", "--set", "flag-default=0"]
+    command += ["--edit", f"track:a{audio_choice}", "--set", "flag-default=1"]
+
+    for i in range(1, subtitle_count + 1):
+        command += ["--edit", f"track:s{i}", "--set", "flag-default=0"]
+    command += ["--edit", f"track:s{subtitle_choice}", "--set", "flag-default=1"]
+
+    return subprocess.run(command).returncode == 0
+
+
+def main():
+    parser = argparse.ArgumentParser(
+        prog="mkv-defaults",
+        description="Interactively set default audio and subtitle tracks for MKV files.",
+    )
+    parser.add_argument(
+        "directory",
+        nargs="?",
+        default=".",
+        help="directory containing MKV files (default: current directory)",
+    )
+    parser.add_argument(
+        "--version",
+        action="version",
+        version=f"%(prog)s {VERSION}",
+    )
+    args = parser.parse_args()
+
+    require_commands()
+
+    directory = Path(args.directory).expanduser().resolve()
+    if not directory.is_dir():
+        die(f"directory not found: {directory}")
+
+    files = sorted(
+        p for p in directory.iterdir()
+        if p.is_file() and p.suffix.lower() == ".mkv"
+    )
+    if not files:
+        die(f"no MKV files found in: {directory}")
+
+    sample = files[0]
+    print(f"Reading track layout from:\n  {sample}\n")
+
+    sample_info = inspect(sample)
+    audio_tracks = tracks_of_type(sample_info, "audio")
+    subtitle_tracks = tracks_of_type(sample_info, "subtitles")
+
+    if not audio_tracks:
+        die("no audio tracks found")
+    if not subtitle_tracks:
+        die("no subtitle tracks found")
+
+    print_tracks("AUDIO TRACKS", audio_tracks)
+    print()
+    audio_choice = choose("audio", audio_tracks)
+
+    print()
+    print_tracks("SUBTITLE TRACKS", subtitle_tracks)
+    print()
+    subtitle_choice = choose("subtitle", subtitle_tracks)
+
+    audio_lang, audio_name, _, _ = track_description(audio_tracks[audio_choice - 1])
+    sub_lang, sub_name, _, _ = track_description(subtitle_tracks[subtitle_choice - 1])
+
+    print("\nSelected:")
+    print(f"  Audio:    [{audio_lang}] {audio_name}")
+    print(f"  Subtitle: [{sub_lang}] {sub_name}")
+    print(f"\nThis will modify {len(files)} MKV file(s) in place.")
+
+    try:
+        confirm = input("Continue? [y/N] ").strip().lower()
+    except (EOFError, KeyboardInterrupt):
+        print("\nCancelled.")
+        return 130
+
+    if confirm != "y":
+        print("Cancelled.")
+        return 0
+
+    expected_audio = signature(audio_tracks)
+    expected_subtitles = signature(subtitle_tracks)
+    changed = skipped = failed = 0
+
+    print()
+    for path in files:
+        print(f"Processing: {path.name}")
+        try:
+            info = inspect(path)
+        except SystemExit:
+            print("  ERROR: could not inspect file.")
+            failed += 1
+            continue
+
+        current_audio = tracks_of_type(info, "audio")
+        current_subtitles = tracks_of_type(info, "subtitles")
+
+        if signature(current_audio) != expected_audio:
+            print("  SKIPPED: audio track layout differs from sample.")
+            skipped += 1
+            continue
+        if signature(current_subtitles) != expected_subtitles:
+            print("  SKIPPED: subtitle track layout differs from sample.")
+            skipped += 1
+            continue
+
+        if edit_file(
+            path,
+            len(audio_tracks),
+            len(subtitle_tracks),
+            audio_choice,
+            subtitle_choice,
+        ):
+            print("  OK")
+            changed += 1
+        else:
+            print("  ERROR")
+            failed += 1
+
+    print(f"\nFinished: {changed} changed, {skipped} skipped, {failed} failed.")
+    return 1 if failed else 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
